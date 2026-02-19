@@ -2,18 +2,17 @@ import asyncio
 import base64
 import io
 import json
-import logging
 import os
 import random
 from typing import Any, Awaitable, Callable, Dict
 
-from openai import APIError, OpenAI, RateLimitError
+from openai import APIError, AsyncOpenAI, RateLimitError
 from redis.asyncio import Redis
 
+from common.async_logging import configure_async_logging
 from common.redis_io import REQUEST_STREAM, redis_client, write_response_object, write_response_raw_json
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("api-worker")
+logger = configure_async_logging("api-worker")
 
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -28,9 +27,9 @@ RETRY_CAP_SEC = float(os.getenv("RETRY_CAP_SEC", "8.0"))
 if not (OPENAI_BASE_URL and OPENAI_API_KEY):
     logger.warning("OPENAI_CREDS is not set")
 
-client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
-client_embeddings = OpenAI(api_key=OPENAI_EMBEDDING_KEY, base_url=OPENAI_EMBEDDING_URL)
-client_transcriptions = OpenAI(api_key=OPENAI_TRANSCRIPTION_KEY, base_url=OPENAI_TRANSCRIPTION_URL)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+client_embeddings = AsyncOpenAI(api_key=OPENAI_EMBEDDING_KEY, base_url=OPENAI_EMBEDDING_URL)
+client_transcriptions = AsyncOpenAI(api_key=OPENAI_TRANSCRIPTION_KEY, base_url=OPENAI_TRANSCRIPTION_URL)
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -58,10 +57,7 @@ async def retry_async(
     last_exc = None
     for i in range(attempts):
         try:
-            res = fn()
-            if asyncio.iscoroutine(res):
-                return await res
-            return res
+            return await fn()
         except Exception as e:
             if not _is_retryable(e):
                 raise
@@ -74,7 +70,6 @@ async def retry_async(
 
 def _prepare_openai_args(payload: Dict[str, Any]) -> Dict[str, Any]:
     args = payload.copy()
-    api = args.get("api", "chat.completions")
     for k in ("request_id", "api"):
         args.pop(k, None)
     logger.info(f"{args.get('parameters')=}")
@@ -94,48 +89,52 @@ def _prepare_openai_args(payload: Dict[str, Any]) -> Dict[str, Any]:
 async def _call_once_chat(args: Dict[str, Any]) -> Any:
     a = dict(args)
     a.pop("stream", None)
-    return client.chat.completions.create(**a)
+    return await client.chat.completions.create(**a)
 
 
 async def _call_once_responses(args: Dict[str, Any]) -> Any:
     a = dict(args)
     a.pop("stream", None)
-    return client.responses.create(**a)
+    return await client.responses.create(**a)
 
 
 async def _stream_chat_completions(args: Dict[str, Any], request_id: str, r: Redis):
-    def _start_stream():
+    async def _start_stream():
         a = dict(args)
         a["stream"] = True
-        return client.chat.completions.create(**a)
+        return await client.chat.completions.create(**a)
     resp = await retry_async(_start_stream)
-    for chunk in resp:
+    async for chunk in resp:
         try:
             chunk_json = chunk.model_dump_json(exclude_unset=True)
             await write_response_raw_json(request_id, chunk_json, client=r)
-        except Exception as e:
-            logger.debug("Chunk serialize error (chat): %s", e)
+        except Exception:
+            logger.exception("Chunk serialize error (chat)")
     await write_response_object(request_id, {"done": True}, client=r)
 
 
 async def _stream_responses_api(args: Dict[str, Any], request_id: str, r: Redis):
-    def _start_stream():
+    async def _start_stream():
         a = dict(args)
         a["stream"] = True
-        return client.responses.create(**a)
+        return await client.responses.create(**a)
     resp = await retry_async(_start_stream)
-    for event in resp:
+    async for event in resp:
         try:
             event_json = event.model_dump_json(exclude_unset=True)
             await write_response_raw_json(request_id, event_json, client=r)
-        except Exception as e:
-            logger.debug("Event serialize error (responses): %s", e)
+        except Exception:
+            logger.exception("Event serialize error (responses)")
 
     await write_response_object(request_id, {"done": True}, client=r)
 
 
 async def handle_message(msg_id: str, fields: Dict[str, Any], r: Redis):
-    payload = json.loads(fields.get("json", "{}"))
+    try:
+        payload = json.loads(fields.get("json", "{}"))
+    except Exception:
+        logger.exception("Invalid payload json for message %s", msg_id)
+        return
     request_id = payload.get("request_id")
     api = payload.get("api", "chat.completions")
     stream = bool(payload.get("stream", False))
@@ -153,22 +152,22 @@ async def handle_message(msg_id: str, fields: Dict[str, Any], r: Redis):
             comp = await retry_async(lambda: _call_once_responses(args))
         elif api == "embeddings.create":
             timeout = args.pop("timeout", None)
-            def _call():
+            async def _call():
                 c = client_embeddings.with_options(timeout=timeout) if timeout is not None else client_embeddings
-                return c.embeddings.create(**args)
+                return await c.embeddings.create(**args)
             comp = await retry_async(_call)
         elif api == "audio.transcriptions.create":
             timeout = args.pop("timeout", None)
             data_b64 = args.pop("file_b64")
             filename = args.pop("filename", "audio.wav")
             uploadable = _uploadable_from_b64(data_b64, filename)
-            def _call():
+            async def _call():
                 c = (
                     client_transcriptions.with_options(timeout=timeout)
                     if timeout is not None
                     else client_transcriptions
                 )
-                return c.audio.transcriptions.create(file=uploadable, **args)
+                return await c.audio.transcriptions.create(file=uploadable, **args)
 
             comp = await retry_async(_call)
             result = _normalize_transcription_result(comp)
@@ -219,20 +218,27 @@ async def worker():
     r = redis_client()
     group = os.getenv("REQUEST_GROUP", "api-service")
     consumer = os.getenv("CONSUMER_NAME") or os.uname().nodename
+    batch_size = int(os.getenv("REQUEST_BATCH_SIZE", "16"))
+    max_parallel = int(os.getenv("MAX_PARALLEL_REQUESTS", "32"))
+    semaphore = asyncio.Semaphore(max_parallel)
     try:
         await r.xgroup_create(REQUEST_STREAM, group, id="$", mkstream=True)
         logger.info("Created consumer group '%s' for stream '%s'", group, REQUEST_STREAM)
-    except Exception as e:
-        if "BUSYGROUP" not in str(e):
-            logger.warning("xgroup_create failed: %s", e)
+    except Exception as exc:
+        if "BUSYGROUP" not in str(exc):
+            logger.exception("xgroup_create failed")
     while True:
-        resp = await r.xreadgroup(group, consumer, streams={REQUEST_STREAM: ">"}, count=1, block=30000)
+        resp = await r.xreadgroup(group, consumer, streams={REQUEST_STREAM: ">"}, count=batch_size, block=30000)
         if not resp:
             continue
         _, messages = resp[0]
-        for mid, fs in messages:
-            await handle_message(mid, fs, r)
-            await r.xack(REQUEST_STREAM, group, mid)
+
+        async def _process(mid, fs):
+            async with semaphore:
+                await handle_message(mid, fs, r)
+                await r.xack(REQUEST_STREAM, group, mid)
+
+        await asyncio.gather(*(_process(mid, fs) for mid, fs in messages))
 
 if __name__ == "__main__":
     asyncio.run(worker())
