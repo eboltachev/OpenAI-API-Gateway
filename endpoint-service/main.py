@@ -6,12 +6,31 @@ from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, StreamingResponse
 
+from common.async_logging import configure_async_logging
 from common.redis_io import enqueue_request, iter_stream_json, redis_client, wait_for_response
 
 app = FastAPI(title="API")
+logger = configure_async_logging("endpoint-service")
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception for path %s", request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
+class RequestBody(BaseModel):
+    model_config = {"extra": "allow"}
+
+
+class EmbeddingsBody(RequestBody):
+    input: Any
+    model: str
+    timeout_ms: Optional[int] = None
 
 
 def _unauthorized(msg: str, code: str):
@@ -41,11 +60,10 @@ async def _auth_middleware(request: Request, call_next):
         if auth.lower().startswith("bearer "):
             token = auth.split(" ", 1)[1].strip()
         token = token or request.headers.get("x-api-key") or request.headers.get("api-key")
-        print(f"{token=}")
-        print(f"{ENDPOINT_API_KEY=}")
         if not token:
             return _unauthorized("You must provide an API key.", "missing_api_key")
         if token != ENDPOINT_API_KEY:
+            logger.warning("Invalid API key from %s", request.client.host if request.client else "unknown")
             return _unauthorized("Incorrect API key provided.", "invalid_api_key")
     return await call_next(request)
 
@@ -60,6 +78,7 @@ async def health():
         pong = await r.ping()
         return {"status": "ok", "redis": bool(pong)}
     except Exception:
+        logger.exception("Health check failed")
         return {"status": "degraded", "redis": False}
 
 
@@ -74,19 +93,17 @@ async def list_models():
     if not resp:
         raise HTTPException(status_code=504, detail="Timeout waiting for models list")
     if "error" in resp:
-        raise HTTPException(status_code=500, detail=resp["error"])
+        logger.error("Models backend error: %s", resp["error"])
+        raise HTTPException(status_code=502, detail=resp["error"])
     return resp.get("result", resp)
 
 
 @app.post("/v1/embeddings")
-async def get_embeddings(body: Dict[str, Any]):
+async def get_embeddings(body: EmbeddingsBody):
+    body_data = body.model_dump(exclude_none=True)
     request_id = str(uuid4())
-    payload = dict(body, request_id=request_id, api="embeddings.create")
-    timeout_ms = body.get("timeout_ms")
-    try:
-        timeout_ms = int(timeout_ms) if timeout_ms is not None else None
-    except Exception:
-        timeout_ms = None
+    payload = dict(body_data, request_id=request_id, api="embeddings.create")
+    timeout_ms = body_data.get("timeout_ms")
     sync_timeout_ms = timeout_ms or int(os.getenv("SYNC_TIMEOUT_MS", "25000"))
     if timeout_ms is not None:
         payload["timeout"] = timeout_ms / 1000.0  # сек для SDK
@@ -95,7 +112,8 @@ async def get_embeddings(body: Dict[str, Any]):
     if not resp:
         raise HTTPException(status_code=504, detail="Timeout waiting for embeddings")
     if "error" in resp:
-        raise HTTPException(status_code=500, detail=resp["error"])
+        logger.error("Embeddings backend error: %s", resp["error"])
+        raise HTTPException(status_code=502, detail=resp["error"])
     return resp.get("result", resp)
 
 
@@ -155,9 +173,13 @@ async def _proxy(body: Dict[str, Any], api_name: str, stream_format: Optional[st
         if not resp:
             raise HTTPException(status_code=504, detail="Timeout waiting for completion")
         if "error" in resp:
-            msg = str(resp["error"]).lower()
-            if "rate" in msg or "429" in msg:
-                raise HTTPException(status_code=429, detail=resp["error"])
+            msg = str(resp["error"])
+            lowered = msg.lower()
+            if "rate" in lowered or "429" in lowered:
+                raise HTTPException(status_code=429, detail=msg)
+            if "401" in lowered or "unauthorized" in lowered or "invalid api key" in lowered:
+                raise HTTPException(status_code=401, detail=msg)
+            raise HTTPException(status_code=502, detail=msg)
         return resp.get("result", resp)
 
     async def sse():
@@ -189,6 +211,7 @@ async def _proxy(body: Dict[str, Any], api_name: str, stream_format: Optional[st
             except asyncio.CancelledError:
                 return
             except Exception as e:
+                logger.exception("SSE error in _proxy")
                 yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
@@ -202,8 +225,8 @@ async def _proxy(body: Dict[str, Any], api_name: str, stream_format: Optional[st
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(body: Dict[str, Any]):
-    return await _proxy(body, "chat.completions")
+async def chat_completions(body: RequestBody):
+    return await _proxy(body.model_dump(exclude_none=True), "chat.completions")
 
 
 def _to_chat_from_completions(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -243,8 +266,9 @@ def _chat_to_completions_response(resp: Dict[str, Any], fallback_model: Any) -> 
 
 
 @app.post("/v1/completions")
-async def completions(body: Dict[str, Any]):
-    chat_body = _to_chat_from_completions(body)
+async def completions(body: RequestBody):
+    body_data = body.model_dump(exclude_none=True)
+    chat_body = _to_chat_from_completions(body_data)
 
     # Если stream=True, проксируем с адаптацией потокового формата в completions
     if bool(chat_body.get("stream", False)):
@@ -252,7 +276,7 @@ async def completions(body: Dict[str, Any]):
             chat_body,
             "chat.completions",
             stream_format="completions",
-            fallback_model=body.get("model"),
+            fallback_model=body_data.get("model"),
         )
         return resp
 
@@ -261,15 +285,15 @@ async def completions(body: Dict[str, Any]):
     if isinstance(resp, StreamingResponse):
         return resp  # на всякий случай, но сюда не попадём
 
-    result = _chat_to_completions_response(resp, fallback_model=body.get("model"))
+    result = _chat_to_completions_response(resp, fallback_model=body_data.get("model"))
     return JSONResponse(result)
 
 
 # ---- Responses API ----
 @app.post("/v1/responses")
-async def responses_api(body: Dict[str, Any]):
+async def responses_api(body: RequestBody):
     request_id = str(uuid4())
-    payload = dict(body)
+    payload = body.model_dump(exclude_none=True)
     payload["request_id"] = request_id
     payload["api"] = "responses"
     stream = bool(payload.get("stream", False))
@@ -280,9 +304,13 @@ async def responses_api(body: Dict[str, Any]):
         if not resp:
             raise HTTPException(status_code=504, detail="Timeout waiting for completion")
         if "error" in resp:
-            msg = str(resp["error"]).lower()
-            if "rate" in msg or "429" in msg:
-                raise HTTPException(status_code=429, detail=resp["error"])
+            msg = str(resp["error"])
+            lowered = msg.lower()
+            if "rate" in lowered or "429" in lowered:
+                raise HTTPException(status_code=429, detail=msg)
+            if "401" in lowered or "unauthorized" in lowered or "invalid api key" in lowered:
+                raise HTTPException(status_code=401, detail=msg)
+            raise HTTPException(status_code=502, detail=msg)
         return resp.get("result", resp)
 
     async def sse():
@@ -305,6 +333,7 @@ async def responses_api(body: Dict[str, Any]):
             except asyncio.CancelledError:
                 return
             except Exception as e:
+                logger.exception("SSE error in responses_api")
                 yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
@@ -352,6 +381,7 @@ async def get_transcriptions(
         try:
             timeout_ms = int(timeout_ms)
         except Exception:
+            logger.exception("Invalid timeout_ms for transcriptions")
             timeout_ms = None
     sync_timeout_ms = timeout_ms or int(os.getenv("SYNC_TIMEOUT_MS", "25000"))
     if timeout_ms is not None:
@@ -361,5 +391,6 @@ async def get_transcriptions(
     if not resp:
         raise HTTPException(status_code=504, detail="Timeout waiting for transcription")
     if "error" in resp:
-        raise HTTPException(status_code=500, detail=resp["error"])
+        logger.error("Transcriptions backend error: %s", resp["error"])
+        raise HTTPException(status_code=502, detail=resp["error"])
     return resp.get("result", resp)
