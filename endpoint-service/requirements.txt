@@ -1,0 +1,6 @@
+python-multipart
+fastapi>=0.112.0
+uvicorn>=0.30.0
+pydantic>=2.7.0
+redis>=5.0.1
+

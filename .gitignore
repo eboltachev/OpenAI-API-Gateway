@@ -1,0 +1,4 @@
+.env
+dev
+.mypy_cache
+venv

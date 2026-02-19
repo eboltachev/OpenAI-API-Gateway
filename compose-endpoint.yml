@@ -1,0 +1,25 @@
+services:
+  endpoint-service:
+    container_name: EndpointService
+    image: endpoint-service
+    build:
+      context: .
+      dockerfile: ./endpoint-service/Dockerfile
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=${REDIS_HOST:-}
+      - REDIS_PORT=${REDIS_PORT:-}
+      - REDIS_USERNAME=${REDIS_USERNAME:-}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REQUEST_STREAM=${REQUEST_STREAM:-openai:requests}
+      - RESPONSE_STREAM_PREFIX=${RESPONSE_STREAM_PREFIX:-openai:responses}
+      - RESPONSE_TTL_SEC=${RESPONSE_TTL_SEC:-300}
+      - MODEL_DEFAULT=${MODEL_DEFAULT:-google/gemma-3-27b-it}
+      - SYNC_TIMEOUT_MS=${SYNC_TIMEOUT_MS:-25000}
+      - API_ENDPOINT_HOST=${API_ENDPOINT_HOST:-0.0.0.0}
+      - API_ENDPOINT_PORT=${API_ENDPOINT_PORT:-11435}
+    ports:
+      - "${API_ENDPOINT_PORT:-11435}:11435"
+    restart: always
+
