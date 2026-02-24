@@ -121,7 +121,9 @@ async def write_response_raw_json(request_id: str, json_str: str, *, client: Opt
     """Пишем сериализованный JSON (чанк OpenAI/Responses) — для стриминга."""
     r = client or redis_client()
     stream = response_stream_name(request_id)
-    msg_id = await r.xadd(stream, {"json": json_str}, maxlen=1000, approximate=True)
+    # Не ограничиваем размер stream во время активного SSE-стриминга:
+    # при trim старые ID могут исчезнуть до чтения потребителем и часть чанков потеряется.
+    msg_id = await r.xadd(stream, {"json": json_str})
     await r.expire(stream, RESPONSE_TTL_SEC)
     return msg_id
 
