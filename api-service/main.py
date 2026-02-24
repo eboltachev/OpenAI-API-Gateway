@@ -236,6 +236,31 @@ async def worker():
     batch_size = int(os.getenv("REQUEST_BATCH_SIZE", "16"))
     max_parallel = int(os.getenv("MAX_PARALLEL_REQUESTS", "32"))
     semaphore = asyncio.Semaphore(max_parallel)
+    in_flight: set[asyncio.Task] = set()
+
+    async def _process(mid: str, fs: Dict[str, Any]):
+        async with semaphore:
+            try:
+                await handle_message(mid, fs, r)
+            finally:
+                await r.xack(REQUEST_STREAM, group, mid)
+
+    def _track(task: asyncio.Task):
+        in_flight.add(task)
+        task.add_done_callback(in_flight.discard)
+
+    async def _wait_for_slot_if_needed():
+        if len(in_flight) < max_parallel:
+            return
+        done, _ = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+
+    async def _drain_finished():
+        finished = [task for task in in_flight if task.done()]
+        for task in finished:
+            task.result()
+
     try:
         await r.xgroup_create(REQUEST_STREAM, group, id="$", mkstream=True)
         logger.info("Created consumer group '%s' for stream '%s'", group, REQUEST_STREAM)
@@ -243,17 +268,16 @@ async def worker():
         if "BUSYGROUP" not in str(exc):
             logger.exception("xgroup_create failed")
     while True:
+        await _wait_for_slot_if_needed()
+        await _drain_finished()
         resp = await r.xreadgroup(group, consumer, streams={REQUEST_STREAM: ">"}, count=batch_size, block=30000)
         if not resp:
             continue
         _, messages = resp[0]
-
-        async def _process(mid, fs):
-            async with semaphore:
-                await handle_message(mid, fs, r)
-                await r.xack(REQUEST_STREAM, group, mid)
-
-        await asyncio.gather(*(_process(mid, fs) for mid, fs in messages))
+        for mid, fs in messages:
+            await _wait_for_slot_if_needed()
+            task = asyncio.create_task(_process(mid, fs))
+            _track(task)
 
 if __name__ == "__main__":
     asyncio.run(worker())
