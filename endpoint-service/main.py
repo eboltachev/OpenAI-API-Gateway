@@ -11,7 +11,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, StreamingResponse
 
 from common.async_logging import configure_async_logging
-from common.redis_io import enqueue_request, iter_stream_json, redis_client, wait_for_response
+from common.redis_io import enqueue_request, get_response_if_ready, iter_stream_json, redis_client, wait_for_response
 
 app = FastAPI(title="API")
 logger = configure_async_logging("endpoint-service")
@@ -113,11 +113,14 @@ async def get_embeddings(body: EmbeddingsBody):
     body_data = body.model_dump(exclude_none=True)
     request_id = str(uuid4())
     payload = dict(body_data, request_id=request_id, api="embeddings.create")
+    async_mode = _is_async_requested(payload)
     timeout_ms = body_data.get("timeout_ms")
     sync_timeout_ms = timeout_ms or int(os.getenv("SYNC_TIMEOUT_MS", "25000"))
     if timeout_ms is not None:
         payload["timeout"] = timeout_ms / 1000.0  # сек для SDK
     await enqueue_request(payload)
+    if async_mode:
+        return _async_accepted_response(request_id)
     resp = await wait_for_response(request_id, timeout_ms=sync_timeout_ms)
     if not resp:
         raise HTTPException(status_code=504, detail="Timeout waiting for embeddings")
@@ -126,6 +129,23 @@ async def get_embeddings(body: EmbeddingsBody):
         raise HTTPException(status_code=502, detail=resp["error"])
     return resp.get("result", resp)
 
+
+
+
+def _is_async_requested(payload: Dict[str, Any]) -> bool:
+    return bool(payload.pop("async", False) or payload.pop("background", False))
+
+
+def _async_accepted_response(request_id: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=202,
+        content={
+            "id": request_id,
+            "object": "async.request",
+            "status": "queued",
+            "status_endpoint": f"/v1/requests/{request_id}",
+        },
+    )
 
 def _adapt_chat_chunk_to_completions(obj: Dict[str, Any], fallback_model: Any) -> Optional[Dict[str, Any]]:
     choices = obj.get("choices", [])
@@ -174,8 +194,15 @@ async def _proxy(body: Dict[str, Any], api_name: str, stream_format: Optional[st
     payload["request_id"] = request_id
     payload["api"] = api_name
     stream = bool(payload.get("stream", False))
+    async_mode = _is_async_requested(payload)
+
+    if async_mode and stream:
+        raise HTTPException(status_code=400, detail="Async mode is not supported with stream=true")
 
     await enqueue_request(payload)
+
+    if async_mode:
+        return _async_accepted_response(request_id)
 
     if not stream:
         timeout_ms = int(os.getenv("SYNC_TIMEOUT_MS", "50000"))
@@ -307,7 +334,12 @@ async def responses_api(body: RequestBody):
     payload["request_id"] = request_id
     payload["api"] = "responses"
     stream = bool(payload.get("stream", False))
+    async_mode = _is_async_requested(payload)
+    if async_mode and stream:
+        raise HTTPException(status_code=400, detail="Async mode is not supported with stream=true")
     await enqueue_request(payload)
+    if async_mode:
+        return _async_accepted_response(request_id)
     if not stream:
         timeout_ms = int(os.getenv("SYNC_TIMEOUT_MS", "25000"))
         resp = await wait_for_response(request_id, timeout_ms=timeout_ms)
@@ -366,6 +398,7 @@ async def get_transcriptions(
     response_format: Optional[str] = Form("verbose_json"),
     timestamp_granularities: Optional[str] = Form("word"),
     timeout_ms: int | None = Form(None),
+    async_request: bool = Form(False),
 ):
     request_id = str(uuid4())
     raw = await file.read()
@@ -397,6 +430,8 @@ async def get_transcriptions(
     if timeout_ms is not None:
         payload["timeout"] = timeout_ms / 1000.0
     await enqueue_request(payload)
+    if async_request:
+        return _async_accepted_response(request_id)
     resp = await wait_for_response(request_id, timeout_ms=sync_timeout_ms)
     if not resp:
         raise HTTPException(status_code=504, detail="Timeout waiting for transcription")
@@ -404,6 +439,16 @@ async def get_transcriptions(
         logger.error("Transcriptions backend error: %s", resp["error"])
         raise HTTPException(status_code=502, detail=resp["error"])
     return resp.get("result", resp)
+
+
+@app.get("/v1/requests/{request_id}")
+async def get_async_request_result(request_id: str):
+    resp = await get_response_if_ready(request_id)
+    if not resp:
+        return JSONResponse(status_code=202, content={"id": request_id, "status": "queued"})
+    if "error" in resp:
+        return JSONResponse(status_code=200, content={"id": request_id, "status": "failed", "error": resp["error"]})
+    return JSONResponse(status_code=200, content={"id": request_id, "status": "completed", "result": resp.get("result", resp)})
 
 
 @app.post("/v1/rerank")
