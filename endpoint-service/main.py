@@ -33,6 +33,16 @@ class EmbeddingsBody(RequestBody):
     timeout_ms: Optional[int] = None
 
 
+
+class RerankBody(RequestBody):
+    model: str
+    query: str
+    documents: list[Any]
+    top_n: Optional[int] = None
+    return_documents: Optional[bool] = None
+    max_chunks_per_doc: Optional[int] = None
+
+
 def _unauthorized(msg: str, code: str):
     return JSONResponse(
         status_code=401,
@@ -394,3 +404,9 @@ async def get_transcriptions(
         logger.error("Transcriptions backend error: %s", resp["error"])
         raise HTTPException(status_code=502, detail=resp["error"])
     return resp.get("result", resp)
+
+
+@app.post("/v1/rerank")
+async def rerank(body: RerankBody):
+    body_data = body.model_dump(exclude_none=True)
+    return await _proxy(body_data, "rerank.create")

@@ -2,7 +2,7 @@
 
 Прокси из двух сервисов:
 - `endpoint-service` — OpenAI-совместимый HTTP endpoint для клиентов.
-- `api-service` — worker, который читает задачи из Redis и вызывает upstream OpenAI-совместимые API (chat/models/responses/embeddings/transcriptions), в том числе на разных хостах/портах.
+- `api-service` — worker, который читает задачи из Redis и вызывает upstream OpenAI-совместимые API (chat/models/responses/rerank/embeddings/transcriptions), в том числе на разных хостах/портах.
 
 ## Архитектура
 1. Клиент вызывает `endpoint-service` по OpenAI API.
