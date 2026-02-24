@@ -153,6 +153,18 @@ async def wait_for_response(
     return json.loads(data) if data else None
 
 
+async def get_response_if_ready(request_id: str, *, client: Optional[Redis] = None) -> Optional[Dict[str, Any]]:
+    """Возвращает последний объект ответа из стрима, если он уже появился."""
+    r = client or redis_client()
+    stream = response_stream_name(request_id)
+    events = await r.xrevrange(stream, count=1)
+    if not events:
+        return None
+    _id, fields = events[0]
+    data = fields.get("json")
+    return json.loads(data) if data else None
+
+
 async def iter_stream_json(
     request_id: str, *, start_id: str = "0-0", block_ms: int = 15000, client: Optional[Redis] = None
 ) -> AsyncIterator[Optional[str]]:
