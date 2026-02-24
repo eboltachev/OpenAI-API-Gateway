@@ -31,7 +31,7 @@ if not (OPENAI_BASE_URL and OPENAI_API_KEY):
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 client_embeddings = AsyncOpenAI(api_key=OPENAI_EMBEDDING_KEY, base_url=OPENAI_EMBEDDING_URL)
-client_reranking = AsyncOpenAI(api_key=OPENAI_RERANKING_KEY, base_url=OPENAI_RERANKING_URL)
+client_reranking = AsyncOpenAI(api_key=OPENAI_RERANKING_KEY, base_url=OPENAI_RERANKING_URL.replace('/v1', '') if OPENAI_RERANKING_URL.endswith('/v1') else OPENAI_RERANKING_URL)
 client_transcriptions = AsyncOpenAI(api_key=OPENAI_TRANSCRIPTION_KEY, base_url=OPENAI_TRANSCRIPTION_URL)
 
 
@@ -103,7 +103,7 @@ async def _call_once_rerank(args: Dict[str, Any]) -> Any:
     a = dict(args)
     a.pop("stream", None)
     # Use relative path so provider-specific base paths like `/v1` are preserved.
-    return await client_reranking.post("rerank", cast_to=Dict[str, Any], body=a)
+    return await client_reranking.post("/v1/rerank", cast_to=Dict[str, Any], body=a)
 
 
 def _dump_result(obj: Any) -> Any:
