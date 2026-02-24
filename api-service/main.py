@@ -18,6 +18,8 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_EMBEDDING_URL = os.getenv("OPENAI_EMBEDDING_URL")
 OPENAI_EMBEDDING_KEY = os.getenv("OPENAI_EMBEDDING_KEY")
+OPENAI_RERANKING_URL = os.getenv("OPENAI_RERANKING_URL")
+OPENAI_RERANKING_KEY = os.getenv("OPENAI_RERANKING_KEY")
 OPENAI_TRANSCRIPTION_URL = os.getenv("OPENAI_TRANSCRIPTION_URL")
 OPENAI_TRANSCRIPTION_KEY = os.getenv("OPENAI_TRANSCRIPTION_KEY")
 RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "5"))
@@ -29,6 +31,7 @@ if not (OPENAI_BASE_URL and OPENAI_API_KEY):
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 client_embeddings = AsyncOpenAI(api_key=OPENAI_EMBEDDING_KEY, base_url=OPENAI_EMBEDDING_URL)
+client_reranking = AsyncOpenAI(api_key=OPENAI_RERANKING_KEY, base_url=OPENAI_RERANKING_URL)
 client_transcriptions = AsyncOpenAI(api_key=OPENAI_TRANSCRIPTION_KEY, base_url=OPENAI_TRANSCRIPTION_URL)
 
 
@@ -72,8 +75,6 @@ def _prepare_openai_args(payload: Dict[str, Any]) -> Dict[str, Any]:
     args = payload.copy()
     for k in ("request_id", "api"):
         args.pop(k, None)
-    logger.info(f"{args.get('parameters')=}")
-    logger.info(f"{args.get('suffix')=}")
     parameters = args.pop("parameters", {})
     args.pop("suffix", None)
     vendor_keys = ("chat_template", "chat_template_kwargs")
@@ -102,7 +103,7 @@ async def _call_once_rerank(args: Dict[str, Any]) -> Any:
     a = dict(args)
     a.pop("stream", None)
     # Use relative path so provider-specific base paths like `/v1` are preserved.
-    return await client.post("rerank", cast_to=Dict[str, Any], body=a)
+    return await client_reranking.post("rerank", cast_to=Dict[str, Any], body=a)
 
 
 def _dump_result(obj: Any) -> Any:
@@ -162,6 +163,7 @@ async def handle_message(msg_id: str, fields: Dict[str, Any], r: Redis):
         elif api == "responses":
             comp = await retry_async(lambda: _call_once_responses(args))
         elif api == "rerank.create":
+            logger.info(f"{args=}")
             comp = await retry_async(lambda: _call_once_rerank(args))
         elif api == "embeddings.create":
             timeout = args.pop("timeout", None)
