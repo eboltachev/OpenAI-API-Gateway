@@ -98,6 +98,12 @@ async def _call_once_responses(args: Dict[str, Any]) -> Any:
     return await client.responses.create(**a)
 
 
+async def _call_once_rerank(args: Dict[str, Any]) -> Any:
+    a = dict(args)
+    a.pop("stream", None)
+    return await client.rerank.create(**a)
+
+
 async def _stream_chat_completions(args: Dict[str, Any], request_id: str, r: Redis):
     async def _start_stream():
         a = dict(args)
@@ -150,6 +156,8 @@ async def handle_message(msg_id: str, fields: Dict[str, Any], r: Redis):
             comp = await retry_async(lambda: client.models.list())
         elif api == "responses":
             comp = await retry_async(lambda: _call_once_responses(args))
+        elif api == "rerank.create":
+            comp = await retry_async(lambda: _call_once_rerank(args))
         elif api == "embeddings.create":
             timeout = args.pop("timeout", None)
             async def _call():
