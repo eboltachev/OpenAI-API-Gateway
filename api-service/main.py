@@ -101,7 +101,11 @@ async def _call_once_responses(args: Dict[str, Any]) -> Any:
 async def _call_once_rerank(args: Dict[str, Any]) -> Any:
     a = dict(args)
     a.pop("stream", None)
-    return await client.rerank.create(**a)
+    return await client.post("/rerank", cast_to=dict, body=a)
+
+
+def _dump_result(obj: Any) -> Any:
+    return obj.model_dump() if hasattr(obj, "model_dump") else obj
 
 
 async def _stream_chat_completions(args: Dict[str, Any], request_id: str, r: Redis):
@@ -183,7 +187,7 @@ async def handle_message(msg_id: str, fields: Dict[str, Any], r: Redis):
             return
         else:
             comp = await retry_async(lambda: _call_once_chat(args))
-        await write_response_object(request_id, {"result": comp.model_dump()}, client=r)
+        await write_response_object(request_id, {"result": _dump_result(comp)}, client=r)
     except Exception as e:
         logger.exception("Failed to handle message")
         await write_response_object(request_id or "unknown", {"error": str(e)}, client=r)
