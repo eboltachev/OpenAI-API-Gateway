@@ -101,7 +101,8 @@ async def _call_once_responses(args: Dict[str, Any]) -> Any:
 async def _call_once_rerank(args: Dict[str, Any]) -> Any:
     a = dict(args)
     a.pop("stream", None)
-    return await client.post("/rerank", cast_to=Dict[str, Any], body=a)
+    # Use relative path so provider-specific base paths like `/v1` are preserved.
+    return await client.post("rerank", cast_to=Dict[str, Any], body=a)
 
 
 def _dump_result(obj: Any) -> Any:
