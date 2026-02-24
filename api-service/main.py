@@ -247,19 +247,24 @@ async def worker():
 
     def _track(task: asyncio.Task):
         in_flight.add(task)
-        task.add_done_callback(in_flight.discard)
 
     async def _wait_for_slot_if_needed():
         if len(in_flight) < max_parallel:
             return
         done, _ = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
-            task.result()
+            try:
+                task.result()
+            finally:
+                in_flight.discard(task)
 
     async def _drain_finished():
         finished = [task for task in in_flight if task.done()]
         for task in finished:
-            task.result()
+            try:
+                task.result()
+            finally:
+                in_flight.discard(task)
 
     try:
         await r.xgroup_create(REQUEST_STREAM, group, id="$", mkstream=True)
