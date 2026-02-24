@@ -319,8 +319,8 @@ async def completions(body: RequestBody):
 
     # Синхронный ответ: проксируем и конвертируем результат
     resp = await _proxy(chat_body, "chat.completions")
-    if isinstance(resp, StreamingResponse):
-        return resp  # на всякий случай, но сюда не попадём
+    if isinstance(resp, (StreamingResponse, JSONResponse)):
+        return resp  # для stream и async-accepted веток
 
     result = _chat_to_completions_response(resp, fallback_model=body_data.get("model"))
     return JSONResponse(result)
