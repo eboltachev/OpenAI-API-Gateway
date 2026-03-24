@@ -35,9 +35,7 @@ class EmbeddingsBody(RequestBody):
 
     @model_validator(mode="after")
     def ensure_input_exists(self):
-        if self.input is None and self.messages is not None:
-            self.input = self.messages
-        if self.input is None:
+        if self.input is None and self.messages is None:
             raise ValueError("Field 'input' is required (or provide 'messages' as compatibility alias).")
         return self
 
@@ -118,7 +116,7 @@ async def list_models():
 
 @app.post("/v1/embeddings")
 async def get_embeddings(body: EmbeddingsBody):
-    body_data = body.model_dump(exclude_none=True, exclude={"messages"})
+    body_data = body.model_dump(exclude_none=True)
     request_id = str(uuid4())
     payload = dict(body_data, request_id=request_id, api="embeddings.create")
     async_mode = _is_async_requested(payload)
