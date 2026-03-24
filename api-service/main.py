@@ -169,7 +169,9 @@ async def handle_message(msg_id: str, fields: Dict[str, Any], r: Redis):
             timeout = args.pop("timeout", None)
             async def _call():
                 c = client_embeddings.with_options(timeout=timeout) if timeout is not None else client_embeddings
-                return await c.embeddings.create(**args)
+                # Use low-level POST to preserve provider-specific fields that are not
+                # part of the OpenAI SDK embeddings.create() typed signature.
+                return await c.post("/embeddings", cast_to=Dict[str, Any], body=args)
             comp = await retry_async(_call)
         elif api == "audio.transcriptions.create":
             timeout = args.pop("timeout", None)
