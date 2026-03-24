@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, StreamingResponse
 
@@ -28,10 +28,18 @@ class RequestBody(BaseModel):
 
 
 class EmbeddingsBody(RequestBody):
-    input: Any
     model: str
+    input: Optional[Any] = None
+    messages: Optional[Any] = None
     timeout_ms: Optional[int] = None
 
+    @model_validator(mode="after")
+    def ensure_input_exists(self):
+        if self.input is None and self.messages is not None:
+            self.input = self.messages
+        if self.input is None:
+            raise ValueError("Field 'input' is required (or provide 'messages' as compatibility alias).")
+        return self
 
 
 class RerankBody(RequestBody):
@@ -110,7 +118,7 @@ async def list_models():
 
 @app.post("/v1/embeddings")
 async def get_embeddings(body: EmbeddingsBody):
-    body_data = body.model_dump(exclude_none=True)
+    body_data = body.model_dump(exclude_none=True, exclude={"messages"})
     request_id = str(uuid4())
     payload = dict(body_data, request_id=request_id, api="embeddings.create")
     async_mode = _is_async_requested(payload)
