@@ -1,4 +1,5 @@
 import os
+import json
 
 import numpy as np
 from dotenv import load_dotenv
@@ -11,17 +12,28 @@ load_dotenv()
 target_url = "http://127.0.0.1:11435/v1"
 target_api_key = os.getenv("ENDPOINT_API_KEY")
 
-source_default_model = os.getenv("OPENAI_DEFAULT_MODEL")
-source_base_url = os.getenv("OPENAI_BASE_URL")
-source_api_key = os.getenv("OPENAI_API_KEY")
+chat_routes = json.loads(os.getenv("OPENAI_CHAT_MODEL_ROUTES", "{}") or "{}")
+embedding_routes = json.loads(os.getenv("OPENAI_EMBEDDING_MODEL_ROUTES", "{}") or "{}")
+transcription_routes = json.loads(os.getenv("OPENAI_TRANSCRIPTION_MODEL_ROUTES", "{}") or "{}")
 
-source_embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL")
-source_embedding_url = os.getenv("OPENAI_EMBEDDING_URL")
-source_embedding_key = os.getenv("OPENAI_EMBEDDING_KEY")
+source_default_model = next((m for m in chat_routes.keys() if m != "*"), None) or os.getenv("TEST_CHAT_MODEL")
+source_chat_route = chat_routes.get(source_default_model, {})
+source_base_url = source_chat_route.get("base_url")
+source_api_key = source_chat_route.get("api_key")
 
-source_transcription_model = os.getenv("OPENAI_TRANSCRIPTION_MODEL")
-source_transcription_url = os.getenv("OPENAI_TRANSCRIPTION_URL")
-source_transcription_key = os.getenv("OPENAI_TRANSCRIPTION_KEY")
+source_embedding_model = next((m for m in embedding_routes.keys() if m != "*"), None) or os.getenv("TEST_EMBEDDING_MODEL")
+source_embedding_route = embedding_routes.get(source_embedding_model, {})
+source_embedding_url = source_embedding_route.get("base_url")
+source_embedding_key = source_embedding_route.get("api_key")
+
+source_transcription_model = next((m for m in transcription_routes.keys() if m != "*"), None) or os.getenv("TEST_TRANSCRIPTION_MODEL")
+source_transcription_route = transcription_routes.get(source_transcription_model, {})
+source_transcription_url = source_transcription_route.get("base_url")
+source_transcription_key = source_transcription_route.get("api_key")
+
+assert source_default_model and source_base_url, "Set OPENAI_CHAT_MODEL_ROUTES or TEST_CHAT_MODEL + creds"
+assert source_embedding_model and source_embedding_url, "Set OPENAI_EMBEDDING_MODEL_ROUTES or TEST_EMBEDDING_MODEL + creds"
+assert source_transcription_model and source_transcription_url, "Set OPENAI_TRANSCRIPTION_MODEL_ROUTES or TEST_TRANSCRIPTION_MODEL + creds"
 
 
 # Chat

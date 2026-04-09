@@ -1,4 +1,5 @@
 import os
+import json
 
 import numpy as np
 from dotenv import load_dotenv
@@ -12,9 +13,15 @@ target_url = "http://127.0.0.1:11435/v1"
 api_key = os.getenv("ENDPOINT_API_KEY", "")
 assert api_key.startswith("sk-")
 
-source_default_model = os.getenv("OPENAI_DEFAULT_MODEL")
-source_embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL")
-source_transcription_model = os.getenv("OPENAI_TRANSCRIPTION_MODEL")
+chat_routes = json.loads(os.getenv("OPENAI_CHAT_MODEL_ROUTES", "{}") or "{}")
+embedding_routes = json.loads(os.getenv("OPENAI_EMBEDDING_MODEL_ROUTES", "{}") or "{}")
+source_default_model = next((m for m in chat_routes.keys() if m != "*"), None) or os.getenv("TEST_CHAT_MODEL")
+source_embedding_model = next((m for m in embedding_routes.keys() if m != "*"), None) or os.getenv("TEST_EMBEDDING_MODEL")
+transcription_routes = json.loads(os.getenv("OPENAI_TRANSCRIPTION_MODEL_ROUTES", "{}") or "{}")
+source_transcription_model = next((m for m in transcription_routes.keys() if m != "*"), None) or os.getenv("TEST_TRANSCRIPTION_MODEL")
+assert source_default_model, "Set OPENAI_CHAT_MODEL_ROUTES or TEST_CHAT_MODEL"
+assert source_embedding_model, "Set OPENAI_EMBEDDING_MODEL_ROUTES or TEST_EMBEDDING_MODEL"
+assert source_transcription_model, "Set OPENAI_TRANSCRIPTION_MODEL_ROUTES or TEST_TRANSCRIPTION_MODEL"
 
 # Models
 target_client = OpenAI(base_url=target_url, api_key=api_key)
