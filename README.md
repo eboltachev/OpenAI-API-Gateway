@@ -30,9 +30,13 @@ docker compose -f compose-endpoint.yml up --build -d
 - `LOG_LEVEL` — уровень логирования.
 
 ### api-service
-- `OPENAI_BASE_URL`, `OPENAI_API_KEY`
-- `OPENAI_EMBEDDING_URL`, `OPENAI_EMBEDDING_KEY`
-- `OPENAI_TRANSCRIPTION_URL`, `OPENAI_TRANSCRIPTION_KEY`
+- `OPENAI_CHAT_MODEL_ROUTES` (optional JSON) — роутинг chat/responses по `model`.
+  - Поддерживается wildcard-маршрут `"*"` как fallback для любой модели.
+  - Пример: `{"openai/gpt-oss-120b":{"base_url":"https://host-a/v1","api_key":"sk-..."}, "google/gemma-4-31B":{"base_url":"https://host-b/v1","api_key":"sk-..."}}`
+- `OPENAI_EMBEDDING_MODEL_ROUTES` (optional JSON) — роутинг embeddings по `model`.
+  - Пример: `{"nomic-ai/nomic-embed-text-v2-moe":{"base_url":"https://embed-a/v1","api_key":"sk-..."}, "BAAI/bge-m3":{"base_url":"https://embed-b/v1","api_key":"sk-..."}, "Qwen/Qwen3-Embedding-8B":{"base_url":"https://embed-c/v1","api_key":"sk-..."}}`
+- `OPENAI_RERANKING_MODEL_ROUTES` (optional JSON) — роутинг rerank по `model`.
+- `OPENAI_TRANSCRIPTION_MODEL_ROUTES` (optional JSON) — роутинг transcriptions по `model`.
 - `REQUEST_GROUP` (default: `api-service`)
 - `CONSUMER_NAME` (optional)
 - `REQUEST_BATCH_SIZE` (default: `16`)
@@ -43,3 +47,4 @@ docker compose -f compose-endpoint.yml up --build -d
 ## Примечания
 - Логирование в обоих сервисах асинхронное (QueueHandler/QueueListener).
 - Для потоковых ответов stream не обрезается во время генерации; очистка происходит по `RESPONSE_TTL_SEC`, чтобы не терять SSE-чанки у медленных клиентов.
+- Если модель не найдена в JSON-роутинге и нет wildcard `"*"`, вернётся ошибка конфигурации.

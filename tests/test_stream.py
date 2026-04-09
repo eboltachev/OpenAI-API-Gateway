@@ -1,4 +1,5 @@
 import os
+import json
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
@@ -10,7 +11,9 @@ load_dotenv()
 
 target_url = "http://127.0.0.1:11435/v1"
 target_api_key = os.getenv("ENDPOINT_API_KEY")
-default_model = os.getenv("OPENAI_DEFAULT_MODEL")
+chat_routes = json.loads(os.getenv("OPENAI_CHAT_MODEL_ROUTES", "{}") or "{}")
+default_model = next((m for m in chat_routes.keys() if m != "*"), None) or os.getenv("TEST_CHAT_MODEL")
+assert default_model, "Set OPENAI_CHAT_MODEL_ROUTES or TEST_CHAT_MODEL"
 
 # Langchain OpenAI simple
 llm = LangchainOpenAI(model=default_model, base_url=target_url, api_key=target_api_key)

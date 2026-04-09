@@ -4,8 +4,9 @@ import io
 import json
 import os
 import random
-from typing import Any, Awaitable, Callable, Dict
+from typing import Any, Awaitable, Callable, Dict, List, Tuple
 
+import httpx
 from openai import APIError, AsyncOpenAI, RateLimitError
 from redis.asyncio import Redis
 
@@ -14,25 +15,62 @@ from common.redis_io import REQUEST_STREAM, redis_client, write_response_object,
 
 logger = configure_async_logging("api-worker")
 
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_EMBEDDING_URL = os.getenv("OPENAI_EMBEDDING_URL")
-OPENAI_EMBEDDING_KEY = os.getenv("OPENAI_EMBEDDING_KEY")
-OPENAI_RERANKING_URL = os.getenv("OPENAI_RERANKING_URL")
-OPENAI_RERANKING_KEY = os.getenv("OPENAI_RERANKING_KEY")
-OPENAI_TRANSCRIPTION_URL = os.getenv("OPENAI_TRANSCRIPTION_URL")
-OPENAI_TRANSCRIPTION_KEY = os.getenv("OPENAI_TRANSCRIPTION_KEY")
 RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "5"))
 RETRY_BASE_SEC = float(os.getenv("RETRY_BASE_SEC", "0.5"))
 RETRY_CAP_SEC = float(os.getenv("RETRY_CAP_SEC", "8.0"))
 
-if not (OPENAI_BASE_URL and OPENAI_API_KEY):
-    logger.warning("OPENAI_CREDS is not set")
+_CLIENT_CACHE: Dict[Tuple[str, str], AsyncOpenAI] = {}
+_HTTP_CLIENT_CACHE: Dict[Tuple[str, str], httpx.AsyncClient] = {}
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
-client_embeddings = AsyncOpenAI(api_key=OPENAI_EMBEDDING_KEY, base_url=OPENAI_EMBEDDING_URL)
-client_reranking = AsyncOpenAI(api_key=OPENAI_RERANKING_KEY, base_url=OPENAI_RERANKING_URL)
-client_transcriptions = AsyncOpenAI(api_key=OPENAI_TRANSCRIPTION_KEY, base_url=OPENAI_TRANSCRIPTION_URL)
+
+def _get_client(base_url: str | None, api_key: str | None) -> AsyncOpenAI:
+    key = ((base_url or "").strip(), (api_key or "").strip())
+    if key not in _CLIENT_CACHE:
+        _HTTP_CLIENT_CACHE[key] = httpx.AsyncClient(verify=False)
+        _CLIENT_CACHE[key] = AsyncOpenAI(api_key=key[1], base_url=key[0], http_client=_HTTP_CLIENT_CACHE[key])
+    return _CLIENT_CACHE[key]
+
+
+def _load_model_routing(env_var: str) -> Dict[str, AsyncOpenAI]:
+    raw = os.getenv(env_var, "").strip()
+    if not raw:
+        return {}
+    try:
+        cfg = json.loads(raw)
+    except Exception:
+        logger.exception("Invalid JSON in %s", env_var)
+        return {}
+    if not isinstance(cfg, dict):
+        logger.warning("%s must be a JSON object", env_var)
+        return {}
+    routes: Dict[str, AsyncOpenAI] = {}
+    for model, conf in cfg.items():
+        if not isinstance(model, str) or not isinstance(conf, dict):
+            continue
+        if not conf.get("base_url"):
+            logger.warning("Missing base_url for %s[%s]", env_var, model)
+            continue
+        routes[model] = _get_client(conf.get("base_url"), conf.get("api_key"))
+    return routes
+
+
+chat_routes = _load_model_routing("OPENAI_CHAT_MODEL_ROUTES")
+embedding_routes = _load_model_routing("OPENAI_EMBEDDING_MODEL_ROUTES")
+reranking_routes = _load_model_routing("OPENAI_RERANKING_MODEL_ROUTES")
+transcription_routes = _load_model_routing("OPENAI_TRANSCRIPTION_MODEL_ROUTES")
+
+
+def _client_for_model(args: Dict[str, Any], routes: Dict[str, AsyncOpenAI], route_name: str) -> AsyncOpenAI:
+    model = args.get("model")
+    if isinstance(model, str):
+        if model in routes:
+            return routes[model]
+        if "*" in routes:
+            return routes["*"]
+        raise ValueError(f"Model '{model}' is not configured in {route_name}")
+    if "*" in routes:
+        return routes["*"]
+    raise ValueError(f"Field 'model' is required for {route_name}")
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -90,20 +128,50 @@ def _prepare_openai_args(payload: Dict[str, Any]) -> Dict[str, Any]:
 async def _call_once_chat(args: Dict[str, Any]) -> Any:
     a = dict(args)
     a.pop("stream", None)
-    return await client.chat.completions.create(**a)
+    c = _client_for_model(a, chat_routes, "OPENAI_CHAT_MODEL_ROUTES")
+    return await c.chat.completions.create(**a)
 
 
 async def _call_once_responses(args: Dict[str, Any]) -> Any:
     a = dict(args)
     a.pop("stream", None)
-    return await client.responses.create(**a)
+    c = _client_for_model(a, chat_routes, "OPENAI_CHAT_MODEL_ROUTES")
+    return await c.responses.create(**a)
 
 
 async def _call_once_rerank(args: Dict[str, Any]) -> Any:
     a = dict(args)
     a.pop("stream", None)
+    c = _client_for_model(a, reranking_routes, "OPENAI_RERANKING_MODEL_ROUTES")
     # Use relative path so provider-specific base paths like `/v1` are preserved.
-    return await client_reranking.post("rerank", cast_to=Dict[str, Any], body=a)
+    return await c.post("rerank", cast_to=Dict[str, Any], body=a)
+
+
+def _extract_models_data(payload: Any) -> List[Dict[str, Any]]:
+    data = payload.get("data", []) if isinstance(payload, dict) else []
+    return [m for m in data if isinstance(m, dict)]
+
+
+async def _list_models_combined() -> Dict[str, Any]:
+    clients = {*chat_routes.values(), *embedding_routes.values(), *reranking_routes.values(), *transcription_routes.values()}
+    merged: Dict[str, Dict[str, Any]] = {}
+    last_error = None
+    for c in clients:
+        try:
+            part = await retry_async(lambda: c.models.list())
+            dumped = _dump_result(part)
+            for model_obj in _extract_models_data(dumped):
+                mid = model_obj.get("id")
+                if isinstance(mid, str):
+                    merged[mid] = model_obj
+        except Exception as e:
+            last_error = e
+            logger.warning("models.list failed for one route: %s", e)
+    if merged:
+        return {"object": "list", "data": list(merged.values())}
+    if last_error:
+        raise last_error
+    return {"object": "list", "data": []}
 
 
 def _dump_result(obj: Any) -> Any:
@@ -114,7 +182,8 @@ async def _stream_chat_completions(args: Dict[str, Any], request_id: str, r: Red
     async def _start_stream():
         a = dict(args)
         a["stream"] = True
-        return await client.chat.completions.create(**a)
+        c = _client_for_model(a, chat_routes, "OPENAI_CHAT_MODEL_ROUTES")
+        return await c.chat.completions.create(**a)
     resp = await retry_async(_start_stream)
     async for chunk in resp:
         try:
@@ -129,7 +198,8 @@ async def _stream_responses_api(args: Dict[str, Any], request_id: str, r: Redis)
     async def _start_stream():
         a = dict(args)
         a["stream"] = True
-        return await client.responses.create(**a)
+        c = _client_for_model(a, chat_routes, "OPENAI_CHAT_MODEL_ROUTES")
+        return await c.responses.create(**a)
     resp = await retry_async(_start_stream)
     async for event in resp:
         try:
@@ -159,7 +229,7 @@ async def handle_message(msg_id: str, fields: Dict[str, Any], r: Redis):
                 await _stream_chat_completions(args, request_id, r)
             return
         if api == "models.list":
-            comp = await retry_async(lambda: client.models.list())
+            comp = await _list_models_combined()
         elif api == "responses":
             comp = await retry_async(lambda: _call_once_responses(args))
         elif api == "rerank.create":
@@ -167,8 +237,10 @@ async def handle_message(msg_id: str, fields: Dict[str, Any], r: Redis):
             comp = await retry_async(lambda: _call_once_rerank(args))
         elif api == "embeddings.create":
             timeout = args.pop("timeout", None)
+
             async def _call():
-                c = client_embeddings.with_options(timeout=timeout) if timeout is not None else client_embeddings
+                base_client = _client_for_model(args, embedding_routes, "OPENAI_EMBEDDING_MODEL_ROUTES")
+                c = base_client.with_options(timeout=timeout) if timeout is not None else base_client
                 # Use low-level POST to preserve provider-specific fields that are not
                 # part of the OpenAI SDK embeddings.create() typed signature.
                 return await c.post("/embeddings", cast_to=Dict[str, Any], body=args)
@@ -179,10 +251,11 @@ async def handle_message(msg_id: str, fields: Dict[str, Any], r: Redis):
             filename = args.pop("filename", "audio.wav")
             uploadable = _uploadable_from_b64(data_b64, filename)
             async def _call():
+                base_client = _client_for_model(args, transcription_routes, "OPENAI_TRANSCRIPTION_MODEL_ROUTES")
                 c = (
-                    client_transcriptions.with_options(timeout=timeout)
+                    base_client.with_options(timeout=timeout)
                     if timeout is not None
-                    else client_transcriptions
+                    else base_client
                 )
                 return await c.audio.transcriptions.create(file=uploadable, **args)
 
