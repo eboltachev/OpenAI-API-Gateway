@@ -147,9 +147,18 @@ async def _call_once_rerank(args: Dict[str, Any]) -> Any:
     return await c.post("rerank", cast_to=Dict[str, Any], body=a)
 
 
-def _extract_models_data(payload: Any) -> List[Dict[str, Any]]:
+def _extract_models_data(payload: Any) -> List[Any]:
     data = payload.get("data", []) if isinstance(payload, dict) else []
-    return [m for m in data if isinstance(m, dict)]
+    return list(data) if isinstance(data, list) else []
+
+
+def _normalize_model_obj(item: Any) -> Dict[str, Any] | None:
+    if isinstance(item, dict):
+        mid = item.get("id")
+        return item if isinstance(mid, str) else None
+    if isinstance(item, str):
+        return {"id": item, "object": "model"}
+    return None
 
 
 async def _list_models_combined() -> Dict[str, Any]:
@@ -158,12 +167,14 @@ async def _list_models_combined() -> Dict[str, Any]:
     last_error = None
     for c in clients:
         try:
-            part = await retry_async(lambda: c.models.list())
-            dumped = _dump_result(part)
-            for model_obj in _extract_models_data(dumped):
-                mid = model_obj.get("id")
-                if isinstance(mid, str):
-                    merged[mid] = model_obj
+            # Use raw HTTP call to avoid strict SDK typing issues when providers
+            # return `data` as strings instead of OpenAI Model objects.
+            part = await retry_async(lambda: c.get("/models", cast_to=Dict[str, Any]))
+            for item in _extract_models_data(part):
+                model_obj = _normalize_model_obj(item)
+                if model_obj is None:
+                    continue
+                merged[model_obj["id"]] = model_obj
         except Exception as e:
             last_error = e
             logger.warning("models.list failed for one route: %s", e)
