@@ -15,6 +15,8 @@ from common.redis_io import enqueue_request, get_response_if_ready, iter_stream_
 
 app = FastAPI(title="API")
 logger = configure_async_logging("endpoint-service")
+MAX_IN_FLIGHT_REQUESTS = int(os.getenv("MAX_IN_FLIGHT_REQUESTS", "128"))
+_request_semaphore = asyncio.Semaphore(MAX_IN_FLIGHT_REQUESTS)
 
 
 @app.exception_handler(Exception)
@@ -195,76 +197,78 @@ def _adapt_chat_chunk_to_completions(obj: Dict[str, Any], fallback_model: Any) -
 
 
 async def _proxy(body: Dict[str, Any], api_name: str, stream_format: Optional[str] = None, fallback_model: Any = None):
-    request_id = str(uuid4())
-    payload = dict(body)
-    payload["request_id"] = request_id
-    payload["api"] = api_name
-    stream = bool(payload.get("stream", False))
-    async_mode = _is_async_requested(payload)
+    async with _request_semaphore:
+        request_id = str(uuid4())
+        payload = dict(body)
+        payload["request_id"] = request_id
+        payload["api"] = api_name
+        stream = bool(payload.get("stream", False))
+        async_mode = _is_async_requested(payload)
 
-    if async_mode and stream:
-        raise HTTPException(status_code=400, detail="Async mode is not supported with stream=true")
+        if async_mode and stream:
+            raise HTTPException(status_code=400, detail="Async mode is not supported with stream=true")
 
-    await enqueue_request(payload)
+        await enqueue_request(payload)
 
-    if async_mode:
-        return _async_accepted_response(request_id)
+        if async_mode:
+            return _async_accepted_response(request_id)
 
-    if not stream:
-        timeout_ms = int(os.getenv("SYNC_TIMEOUT_MS", "50000"))
-        resp = await wait_for_response(request_id, timeout_ms=timeout_ms)
-        if not resp:
-            raise HTTPException(status_code=504, detail="Timeout waiting for completion")
-        if "error" in resp:
-            msg = str(resp["error"])
-            lowered = msg.lower()
-            if "rate" in lowered or "429" in lowered:
-                raise HTTPException(status_code=429, detail=msg)
-            if "401" in lowered or "unauthorized" in lowered or "invalid api key" in lowered:
-                raise HTTPException(status_code=401, detail=msg)
-            raise HTTPException(status_code=502, detail=msg)
-        return resp.get("result", resp)
+        if not stream:
+            timeout_ms = int(os.getenv("SYNC_TIMEOUT_MS", "50000"))
+            resp = await wait_for_response(request_id, timeout_ms=timeout_ms)
+            if not resp:
+                raise HTTPException(status_code=504, detail="Timeout waiting for completion")
+            if "error" in resp:
+                msg = str(resp["error"])
+                lowered = msg.lower()
+                if "rate" in lowered or "429" in lowered:
+                    raise HTTPException(status_code=429, detail=msg)
+                if "401" in lowered or "unauthorized" in lowered or "invalid api key" in lowered:
+                    raise HTTPException(status_code=401, detail=msg)
+                raise HTTPException(status_code=502, detail=msg)
+            return resp.get("result", resp)
 
-    async def sse():
-        async for j in iter_stream_json(request_id):
-            try:
-                if j is None:
-                    yield ": keepalive\n\n"
-                    continue
-                obj = json.loads(j)
-
-                if obj.get("done") is True:
-                    yield "data: [DONE]\n\n"
-                    return
-
-                if obj.get("error"):
-                    yield f"data: {json.dumps({'error': obj['error']}, ensure_ascii=False)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-
-                if stream_format == "completions":
-                    mapped = _adapt_chat_chunk_to_completions(obj, fallback_model=fallback_model)
-                    if mapped is None:
-                        # skip chunks that don't contain text or finish_reason
+        async def sse():
+            async for j in iter_stream_json(request_id):
+                try:
+                    if j is None:
+                        yield ": keepalive\n\n"
                         continue
-                    yield f"data: {json.dumps(mapped, ensure_ascii=False)}\n\n"
-                else:
-                    yield f"data: {j}\n\n"
 
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                logger.exception("SSE error in _proxy")
-                yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-                return
+                    obj = json.loads(j)
 
-    headers = {
-        "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-    }
-    return StreamingResponse(sse(), media_type="text/event-stream", headers=headers)
+                    if obj.get("done") is True:
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    if obj.get("error"):
+                        yield f"data: {json.dumps({'error': obj['error']}, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    if stream_format == "completions":
+                        mapped = _adapt_chat_chunk_to_completions(obj, fallback_model=fallback_model)
+                        if mapped is None:
+                            continue
+                        yield f"data: {json.dumps(mapped, ensure_ascii=False)}\n\n"
+                    else:
+                        yield f"data: {j}\n\n"
+
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    logger.exception("SSE error in _proxy")
+                    yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+        headers = {
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+
+        return StreamingResponse(sse(), media_type="text/event-stream", headers=headers)
 
 
 @app.post("/v1/chat/completions")
